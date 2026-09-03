@@ -433,6 +433,20 @@ func withJobAuthorSignature(ctx context.Context, job *provisioning.Job) context.
 	return repository.WithAuthorSignature(ctx, repository.CommitSignature{Name: name, Email: email})
 }
 
+func isAuthFailureMessage(messages []string) bool {
+	for _, msg := range messages {
+		// Repo may be read only, but token is still valid
+		if strings.Contains(msg, repository.WritePermissionDeniedDetail) {
+			continue
+		}
+		if strings.Contains(msg, repository.ErrUnauthorized.Error()) ||
+			strings.Contains(msg, repository.ErrPermissionDenied.Error()) {
+			return true
+		}
+	}
+	return false
+}
+
 func (d *jobProcessor) processJob(ctx context.Context, recorder JobProgressRecorder) error {
 	ctx, span := tracing.Start(ctx, "provisioning.jobs.process_job")
 	defer span.End()
@@ -502,6 +516,30 @@ func (d *jobProcessor) processJob(ctx context.Context, recorder JobProgressRecor
 		if appcontroller.IsPendingDelete(r.Labels) {
 			logger.Info("repository namespace is pending deletion - skip job")
 			recorder.Record(ctx, NewPathOnlyResult(repoName).WithWarning(errors.New("repository namespace is pending deletion - job skipped")).Build())
+			return nil
+		}
+
+		// Every worker talks to the repository, so a repository known to be
+		// unreachable (revoked credentials, expired token) only produces a
+		// failed job the user can't act on from the job itself. Skip with a
+		// warning result instead: the repository status already says why, and
+		// failing here would count against the job success rate for something
+		// outside our control.
+		//
+		// Gated on HealthFailureHealth specifically: a HealthFailureHook status
+		// (e.g. the token lacks webhook-admin permission) can carry the same
+		// "permission denied" wording while repo content reads/writes still
+		// work fine, so it must not trigger this skip.
+		//
+		// TODO: https://github.com/grafana/git-ui-sync-project/issues/177
+		// Use structured error instead of health.Message
+		if health := r.Status.Health; health.Checked > 0 && !health.Healthy &&
+			health.Error == provisioning.HealthFailureHealth && isAuthFailureMessage(health.Message) {
+			logger.Info("repository is unreachable - skip job",
+				"health_error", health.Error,
+				"health_messages", health.Message,
+			)
+			recorder.Record(ctx, NewPathOnlyResult(repoName).WithWarning(errors.New("repository is unreachable - job skipped")).Build())
 			return nil
 		}
 

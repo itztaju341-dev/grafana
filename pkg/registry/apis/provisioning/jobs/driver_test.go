@@ -66,6 +66,51 @@ func TestSumTotalDryRun(t *testing.T) {
 	require.Equal(t, 8, sumTotalDryRun(provisioning.JobActionPull, pullSummaries))
 }
 
+// TestIsAuthFailureMessage covers the message shapes that actually reach
+// HealthStatus.Message: repository.ErrUnauthorized/ErrPermissionDenied text,
+// sometimes wrapped with extra context (e.g. translateGitLabError wraps an
+// expired token as "authentication token has expired: authentication
+// failed"), versus repository.WritePermissionDeniedDetail, which must not
+// match even though its text contains "permission denied" as a substring.
+func TestIsAuthFailureMessage(t *testing.T) {
+	tests := []struct {
+		name     string
+		messages []string
+		want     bool
+	}{
+		{name: "no messages", messages: nil, want: false},
+		{name: "unrelated message", messages: []string{"boom"}, want: false},
+		{name: "bare unauthorized", messages: []string{repository.ErrUnauthorized.Error()}, want: true},
+		{name: "bare permission denied", messages: []string{repository.ErrPermissionDenied.Error()}, want: true},
+		{
+			name:     "wrapped unauthorized",
+			messages: []string{"authentication token has expired: " + repository.ErrUnauthorized.Error()},
+			want:     true,
+		},
+		{
+			name:     "write permission denied does not match",
+			messages: []string{repository.WritePermissionDeniedDetail},
+			want:     false,
+		},
+		{
+			name:     "write permission denied alongside an unrelated message",
+			messages: []string{repository.WritePermissionDeniedDetail, "boom"},
+			want:     false,
+		},
+		{
+			name:     "write permission denied alongside a genuine auth failure",
+			messages: []string{repository.WritePermissionDeniedDetail, repository.ErrUnauthorized.Error()},
+			want:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isAuthFailureMessage(tt.messages))
+		})
+	}
+}
+
 func makeTestJob(rv string) *provisioning.Job {
 	return &provisioning.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -428,6 +473,133 @@ func TestProcessJob_NormalAction_RepoPendingDelete_SkipsJob(t *testing.T) {
 	require.NoError(t, err)
 
 	worker.AssertNotCalled(t, "Process", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestProcessJob_AuthFailureRepo_SkipsJob covers a repository already known to
+// be unreachable due to an auth failure (e.g. revoked credentials). Running
+// the job would only produce a failure the user can't act on from the job
+// itself -- and one that counts against the job success rate -- so it is
+// skipped with a warning result instead, leaving the repository status as the
+// place the reason is surfaced.
+func TestProcessJob_AuthFailureRepo_SkipsJob(t *testing.T) {
+	worker := &MockWorker{}
+	repoGetter := &MockRepoGetter{}
+	recorder := &MockJobProgressRecorder{}
+	driver := setupDriverForProcessJob(worker, repoGetter)
+	driver.currentJob = makeTestJob("1")
+
+	repoCfg := makeRepoConfig("test-repo", nil, nil)
+	repoCfg.Status.Health = provisioning.HealthStatus{
+		Healthy: false,
+		Error:   provisioning.HealthFailureHealth,
+		Checked: time.Now().UnixMilli(),
+		Message: []string{"authentication failed"},
+	}
+	mockRepo := &repository.MockRepository{}
+	mockRepo.On("Config").Return(repoCfg)
+
+	worker.EXPECT().IsSupported(mock.Anything, mock.Anything).Return(true)
+	repoGetter.EXPECT().GetRepository(mock.Anything, "test-ns", "test-repo").
+		Return(mockRepo, nil)
+	recorder.EXPECT().Record(mock.Anything, mock.Anything)
+
+	err := driver.processJob(context.Background(), recorder)
+	require.NoError(t, err, "an unreachable repository must not fail the job")
+
+	worker.AssertNotCalled(t, "Process", mock.Anything, mock.Anything, mock.Anything, mock.Anything)
+}
+
+// TestProcessJob_UnhealthyButReachableRepo_CallsWorker covers a repository
+// that's unhealthy for a reason that doesn't mean it's unreachable -- e.g. a
+// write blocked by branch protection or write-only permissions. Reads (and
+// other writes) still work against a repository like this, so the job must
+// still run rather than being skipped as if credentials were broken.
+func TestProcessJob_UnhealthyButReachableRepo_CallsWorker(t *testing.T) {
+	worker := &MockWorker{}
+	repoGetter := &MockRepoGetter{}
+	recorder := &MockJobProgressRecorder{}
+	driver := setupDriverForProcessJob(worker, repoGetter)
+	driver.currentJob = makeTestJob("1")
+
+	repoCfg := makeRepoConfig("test-repo", nil, nil)
+	repoCfg.Status.Health = provisioning.HealthStatus{
+		Healthy: false,
+		Error:   provisioning.HealthFailureHealth,
+		Checked: time.Now().UnixMilli(),
+		Message: []string{repository.WritePermissionDeniedDetail},
+	}
+	mockRepo := &repository.MockRepository{}
+	mockRepo.On("Config").Return(repoCfg)
+
+	worker.EXPECT().IsSupported(mock.Anything, mock.Anything).Return(true)
+	repoGetter.EXPECT().GetRepository(mock.Anything, "test-ns", "test-repo").
+		Return(mockRepo, nil)
+	worker.EXPECT().Process(mock.Anything, mockRepo, mock.Anything, recorder).Return(nil)
+
+	err := driver.processJob(context.Background(), recorder)
+	require.NoError(t, err)
+
+	worker.AssertCalled(t, "Process", mock.Anything, mockRepo, mock.Anything, recorder)
+}
+
+// TestProcessJob_HookPermissionFailure_CallsWorker covers a repository whose
+// webhook management failed with a permission error (e.g. the token lacks
+// webhook-admin scope) while its content check still passes. That's recorded
+// as HealthFailureHook, not HealthFailureHealth, and its message can contain
+// the same "permission denied" wording an auth failure would -- but repo
+// reads/writes still work fine, so the job must still run.
+func TestProcessJob_HookPermissionFailure_CallsWorker(t *testing.T) {
+	worker := &MockWorker{}
+	repoGetter := &MockRepoGetter{}
+	recorder := &MockJobProgressRecorder{}
+	driver := setupDriverForProcessJob(worker, repoGetter)
+	driver.currentJob = makeTestJob("1")
+
+	repoCfg := makeRepoConfig("test-repo", nil, nil)
+	repoCfg.Status.Health = provisioning.HealthStatus{
+		Healthy: false,
+		Error:   provisioning.HealthFailureHook,
+		Checked: time.Now().UnixMilli(),
+		Message: []string{"execute webhook create: " + repository.ErrPermissionDenied.Error()},
+	}
+	mockRepo := &repository.MockRepository{}
+	mockRepo.On("Config").Return(repoCfg)
+
+	worker.EXPECT().IsSupported(mock.Anything, mock.Anything).Return(true)
+	repoGetter.EXPECT().GetRepository(mock.Anything, "test-ns", "test-repo").
+		Return(mockRepo, nil)
+	worker.EXPECT().Process(mock.Anything, mockRepo, mock.Anything, recorder).Return(nil)
+
+	err := driver.processJob(context.Background(), recorder)
+	require.NoError(t, err)
+
+	worker.AssertCalled(t, "Process", mock.Anything, mockRepo, mock.Anything, recorder)
+}
+
+// TestProcessJob_UncheckedHealth_CallsWorker guards the skip above against
+// blocking a repository that simply hasn't had its first health check yet:
+// unhealthy is only trusted once Checked is set.
+func TestProcessJob_UncheckedHealth_CallsWorker(t *testing.T) {
+	worker := &MockWorker{}
+	repoGetter := &MockRepoGetter{}
+	recorder := &MockJobProgressRecorder{}
+	driver := setupDriverForProcessJob(worker, repoGetter)
+	driver.currentJob = makeTestJob("1")
+
+	repoCfg := makeRepoConfig("test-repo", nil, nil)
+	repoCfg.Status.Health = provisioning.HealthStatus{Healthy: false}
+	mockRepo := &repository.MockRepository{}
+	mockRepo.On("Config").Return(repoCfg)
+
+	worker.EXPECT().IsSupported(mock.Anything, mock.Anything).Return(true)
+	repoGetter.EXPECT().GetRepository(mock.Anything, "test-ns", "test-repo").
+		Return(mockRepo, nil)
+	worker.EXPECT().Process(mock.Anything, mockRepo, mock.Anything, recorder).Return(nil)
+
+	err := driver.processJob(context.Background(), recorder)
+	require.NoError(t, err)
+
+	worker.AssertCalled(t, "Process", mock.Anything, mockRepo, mock.Anything, recorder)
 }
 
 func TestProcessJob_HealthyRepo_CallsWorker(t *testing.T) {
