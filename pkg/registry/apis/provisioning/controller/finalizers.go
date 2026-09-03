@@ -76,9 +76,14 @@ func (f *finalizer) process(ctx context.Context,
 			// NOTE: the controller loop will never get run unless a finalizer is set
 			logger.Info("running cleanup finalizer")
 			webhookRepo, ok := repo.(repository.WebhookRepository)
-			if ok {
-				if err = webhookOnDelete(ctx, webhookRepo); err != nil {
-					err = fmt.Errorf("execute deletion hooks: %w", err)
+			if repo.Config().Status.Webhook != nil {
+				if ok {
+					if err = webhookOnDelete(ctx, webhookRepo); err != nil {
+						err = fmt.Errorf("execute deletion hooks: %w", err)
+						outcome = metricutils.ErrorOutcome
+					}
+				} else {
+					err = fmt.Errorf("repo has webhook to delete but repo could not be resolved to a WebhookRepository")
 					outcome = metricutils.ErrorOutcome
 				}
 			}

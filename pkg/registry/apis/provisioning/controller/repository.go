@@ -746,7 +746,26 @@ func (rc *RepositoryController) process(key string) (err error) {
 	logger = logger.WithContext(ctx)
 
 	if obj.DeletionTimestamp != nil {
-		return rc.handleDelete(ctx, obj)
+		err := rc.handleDelete(ctx, obj)
+		if err == nil || !rc.isUserCaused(err) {
+			return err
+		}
+
+		// TODO: Write to delete status instead once we surface these errors to users
+		logger.Warn("unable to delete repository, user-facing error", "error", err)
+		patchOps := rc.healthPatchIfChanged(obj, provisioning.HealthStatus{
+			Healthy: false,
+			Error:   provisioning.HealthFailureHealth,
+			Checked: time.Now().UnixMilli(),
+			Message: []string{fmt.Sprintf("unable to delete repository: %s", err)},
+		})
+		if len(patchOps) > 0 {
+			if patchErr := rc.statusPatcher.Patch(ctx, obj, patchOps...); patchErr != nil {
+				logger.Error("failed to update repository health after delete error", "error", patchErr)
+			}
+		}
+
+		return nil
 	}
 
 	// Skip reconciliation for resources whose namespace is being soft-deleted.
@@ -931,6 +950,22 @@ func (rc *RepositoryController) process(key string) (err error) {
 			repo, err = rc.repoFactory.Build(ctx, obj)
 		}
 		if err != nil {
+			patchOperations = append(patchOperations, rc.healthPatchIfChanged(obj, provisioning.HealthStatus{
+				Healthy: false,
+				Error:   provisioning.HealthFailureHealth,
+				Checked: time.Now().UnixMilli(),
+				Message: []string{err.Error()},
+			})...)
+
+			// Revoked credentials and missing scopes need the user to fix them:
+			// returning an error would re-log this at ERROR on every pass (burning
+			// the alert error budget) without changing the outcome. The unhealthy
+			// status patched above is what actually surfaces it to the user.
+			if rc.isUserCaused(err) {
+				logger.Warn("unable to create repository from configuration, user-facing error", "error", err)
+				return nil
+			}
+
 			return fmt.Errorf("unable to create repository from configuration: %w", err)
 		}
 	}
@@ -1006,11 +1041,7 @@ func (rc *RepositoryController) process(key string) (err error) {
 		}
 
 		healthResult.ReadyCondition = buildReadyConditionWithReason(healthStatus, provisioning.ReasonQuotaExceeded)
-		patchOperations = append(patchOperations, map[string]interface{}{
-			"op":    "replace",
-			"path":  "/status/health",
-			"value": healthStatus,
-		})
+		patchOperations = append(patchOperations, rc.healthPatchIfChanged(obj, healthStatus)...)
 	} else if len(healthResult.PatchOps) > 0 {
 		patchOperations = append(patchOperations, healthResult.PatchOps...)
 	}
@@ -1106,25 +1137,36 @@ func (rc *RepositoryController) process(key string) (err error) {
 // missing) that got skipped this pass due to cooldown/repo unreachability, as
 // opposed to there being genuinely nothing to do — the caller uses this to
 // decide whether it's safe to advance observedGeneration.
-func (rc *RepositoryController) processHooks(ctx context.Context, repo repository.Repository, obj *provisioning.Repository, repoHealthy bool, shouldRotateSecret bool) (hookOps []map[string]interface{}, failureStatus *provisioning.HealthStatus, suppressed bool, err error) {
+func (rc *RepositoryController) processHooks(ctx context.Context, repo repository.Repository, obj *provisioning.Repository, repoHealthy bool, shouldRotateSecret bool) (hookOps []map[string]interface{}, failureStatus *provisioning.HealthStatus, suppressWebhooks bool, err error) {
 	ctx, span := rc.tracer.Start(ctx, "provisioning.controller.process_hooks", repoSpanAttrs(obj))
 	defer span.End()
 	webhookMissing := len(obj.Spec.Workflows) > 0 &&
 		repository.GetID(obj.Status.Webhook).IsEmpty()
 
-	shouldRunHooks := (obj.Generation != obj.Status.ObservedGeneration) || webhookMissing
+	hasHookChanges := (obj.Generation != obj.Status.ObservedGeneration) || webhookMissing
 	_, webhookCapable := repo.(repository.WebhookRepository)
-	hasWebhookToManage := webhookCapable && (len(obj.Spec.Workflows) > 0 || !repository.GetID(obj.Status.Webhook).IsEmpty())
+	hasWebhookToManage := webhookCapable && webhookExpected(obj)
+	isInHookFailureCooldown := rc.healthChecker.inHookFailureCooldown(obj)
 
 	// Suppress the hook retry while the hook-failure cooldown is active, or while
 	// the repository just failed its health check (it's known unreachable, so any
 	// create/update/delete call against it is doomed).
-	if shouldRunHooks && hasWebhookToManage && (rc.healthChecker.inHookFailureCooldown(obj) || !repoHealthy) {
-		shouldRunHooks = false
-		suppressed = true
+	if hasHookChanges && hasWebhookToManage && (isInHookFailureCooldown || !repoHealthy) {
+		suppressWebhooks = true
 	}
 
-	if shouldRunHooks {
+	suppressionMsg := "hooks were not suppressed"
+	if suppressWebhooks {
+		suppressionMsg = "hooks were suppressed"
+	}
+	logging.FromContext(ctx).Info(suppressionMsg,
+		"hasWebhookToManage", hasWebhookToManage,
+		"webhookCapable", webhookCapable,
+		"isInHookFailureCooldown", isInHookFailureCooldown,
+		"repoHealthy", repoHealthy,
+	)
+
+	if hasHookChanges && !suppressWebhooks {
 		hookOps, err = rc.runHooks(ctx, repo, obj)
 		if err != nil {
 			status := rc.healthChecker.recordFailure(provisioning.HealthFailureHook, err)
@@ -1153,7 +1195,19 @@ func (rc *RepositoryController) processHooks(ctx context.Context, repo repositor
 		}
 	}
 
-	return hookOps, nil, suppressed, nil
+	return hookOps, nil, suppressWebhooks, nil
+}
+
+func (rc *RepositoryController) healthPatchIfChanged(obj *provisioning.Repository, status provisioning.HealthStatus) []map[string]interface{} {
+	if !rc.healthChecker.hasHealthStatusChanged(obj.Status.Health, status) {
+		return nil
+	}
+
+	return []map[string]interface{}{{
+		"op":    "replace",
+		"path":  "/status/health",
+		"value": status,
+	}}
 }
 
 // Returns errors that are due to user errors
